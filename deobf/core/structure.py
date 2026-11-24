@@ -1,0 +1,1226 @@
+import copy
+import re
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import luasym as sym
+from luasym import Const, Reg, Pseudo, Global, Upval, Index, Bin, Un, TempVal, Vararg, ClosureExpr, Multi
+
+class Block:
+    __slots__ = ("id", "stmts", "kind", "cond", "succ", "values", "error", "preds", "origin", "path")
+
+    def __init__(self, bid):
+        self.id = bid
+        self.stmts = []
+        self.kind = "goto"
+        self.cond = None
+        self.succ = []
+        self.values = None
+        self.error = None
+        self.preds = []
+        self.origin = None
+        self.path = ""
+
+    def __repr__(self):
+        return "B%s(%s->%s)" % (self.id, self.kind, [b for b in self.succ])
+
+def build_cfg(entry_key, order, irm, link):
+    nodes = dict(order)
+    blocks = {}
+    counter = [0]
+
+    def new_block():
+        counter[0] += 1
+        b = Block(counter[0])
+        blocks[b.id] = b
+        return b
+
+    head = {}
+
+    def head_of(key):
+        b = head.get(key)
+        if b is None:
+            b = new_block()
+            b.origin = (key[0], key[1])
+            head[key] = b
+        return b
+
+    for key, node in order:
+        b = head_of(key)
+        fill(b, node, key, new_block, head_of, nodes, irm, link)
+    entry = head_of(entry_key)
+    for b in blocks.values():
+        b.preds = []
+    for b in blocks.values():
+        for s in b.succ:
+            blocks[s].preds.append(b.id)
+    return entry.id, blocks
+
+def fill(b, node, key, new_block, head_of, nodes, irm, link):
+    if getattr(node, "error", None):
+        b.stmts += node.stmts
+        b.kind = "error"
+        b.error = "%s (at %s:%s)" % (node.error, key[0], key[1])
+        return
+    b.stmts += [s for s in node.stmts if not getattr(s, "jump", False)]
+    if node.cond is not None:
+        dec = getattr(node, "decided", None)
+        if dec is True or dec is False:
+            sub = node.then if dec else node.els
+            fill(b, sub, key, new_block, head_of, nodes, irm, link)
+            return
+        if dec == "unset":
+            b.kind = "end"
+            return
+        t = new_block()
+        e = new_block()
+        t.origin = e.origin = (key[0], key[1])
+        t.path, e.path = b.path + "t", b.path + "e"
+        b.kind = "cond"
+        b.cond = node.cond
+        b.succ = [t.id, e.id]
+        fill(t, node.then, key, new_block, head_of, nodes, irm, link) if node.then else setattr(t, "kind", "end")
+        fill(e, node.els, key, new_block, head_of, nodes, irm, link) if node.els else setattr(e, "kind", "end")
+        return
+    oc = node.outcome
+    if isinstance(oc, irm.Next):
+        nk = oc.state.key(link)
+        if nk not in nodes:
+            b.kind = "error"
+            b.error = "unexplored successor %s:%s" % (nk[0], nk[1])
+            return
+        b.kind = "goto"
+        b.succ = [head_of(nk).id]
+    elif isinstance(oc, irm.Ret):
+        b.kind = "ret"
+        b.values = oc.values
+    elif isinstance(oc, irm.Crash):
+        b.kind = "crash"
+    else:
+        b.kind = "end"
+
+_temp_re = re.compile(r"\bT([^\s\[\]=(),]+)(?=\[| =)")
+
+def _rename_temps(x, m, seen):
+    st = [x]
+    while st:
+        o = st.pop()
+        if isinstance(o, (list, tuple)):
+            st += o
+            continue
+        if id(o) in seen:
+            continue
+        seen.add(id(o))
+        t = getattr(o, "t", None)
+        if isinstance(t, str) and t in m and type(o).__name__ in ("TempVal", "TempTail", "CallStmt"):
+            o.t = m[t]
+        d = getattr(o, "__dict__", None)
+        if d is not None and type(o).__name__ not in ("LTable", "Scope", "LuaFunc"):
+            st += [v for v in d.values() if v is not None and not isinstance(v, (str, int, float, bytes, bool))]
+
+class Partition:
+    def __init__(self, blocks, labels):
+        self.blocks = blocks
+        self.cls = {}
+        self.members = {}
+        self.dirty = {}
+        self.sigs = {}
+        self.count = 0
+        self.preds = {}
+        for bid, b in blocks.items():
+            for s in b.succ:
+                self.preds.setdefault(s, []).append(bid)
+        ids = {}
+        for bid in blocks:
+            c = ids.setdefault(labels[bid], len(ids))
+            self.cls[bid] = c
+            self.members.setdefault(c, set()).add(bid)
+        self.count = len(ids)
+        for c, mem in self.members.items():
+            self.dirty[c] = set(mem)
+
+    def fresh(self, mem, sig):
+        c = self.count
+        self.count += 1
+        self.members[c] = mem
+        self.sigs[c] = sig
+        cls = self.cls
+        dirty = self.dirty
+        moved = None
+        for bid in mem:
+            old = dirty.get(cls[bid])
+            if old is not None and bid in old:
+                old.discard(bid)
+                if moved is None:
+                    moved = set()
+                moved.add(bid)
+            cls[bid] = c
+        if moved:
+            dirty[c] = moved
+        return c
+
+    def touch(self, mem):
+        cls = self.cls
+        dirty = self.dirty
+        preds = self.preds
+        for bid in mem:
+            for p in preds.get(bid, ()):
+                dirty.setdefault(cls[p], set()).add(p)
+
+    def isolate(self, bid):
+        c = self.cls[bid]
+        mem = self.members[c]
+        if len(mem) < 2:
+            return
+        mem.discard(bid)
+        self.fresh({bid}, self.sigs.get(c))
+        self.touch((bid,))
+
+    def refine(self):
+        blocks = self.blocks
+        cls = self.cls
+        members = self.members
+        dirty = self.dirty
+        sigs = self.sigs
+        while dirty:
+            c, todo = dirty.popitem()
+            if not todo:
+                continue
+            mem = members[c]
+            groups = {}
+            for bid in todo:
+                sig = tuple([cls.get(s) for s in blocks[bid].succ])
+                g = groups.get(sig)
+                if g is None:
+                    groups[sig] = g = set()
+                g.add(bid)
+            clean = len(mem) - len(todo)
+            base = sigs.get(c) if clean else None
+            if clean == 0 and len(groups) == 1:
+                sigs[c] = next(iter(groups))
+                continue
+            if clean and len(groups) == 1 and base in groups:
+                continue
+            stay = clean + len(groups.get(base, ())) if clean else 0
+            keep = base if clean else None
+            size = stay
+            for sig, g in groups.items():
+                if clean and sig == base:
+                    continue
+                if len(g) > size:
+                    keep, size = sig, len(g)
+            changed = []
+            if clean and keep != base:
+                rest = set(mem)
+                for sig, g in groups.items():
+                    if sig != base:
+                        rest -= g
+                self.fresh(rest, base)
+                changed.append(rest)
+                members[c] = groups[keep]
+                sigs[c] = keep
+                for sig, g in groups.items():
+                    if sig != base and sig != keep:
+                        self.fresh(g, sig)
+                        changed.append(g)
+            else:
+                for sig, g in groups.items():
+                    if sig == keep:
+                        continue
+                    mem -= g
+                    self.fresh(g, sig)
+                    changed.append(g)
+                sigs[c] = keep
+            for g in changed:
+                self.touch(g)
+
+def merge_equivalent(entry, blocks, irm):
+    def text(b):
+        parts = [repr(b.origin), b.path, b.kind]
+        parts += [irm.fmt_stmt(s) for s in b.stmts]
+        if b.cond is not None:
+            parts.append("? " + irm.fmt_expr(b.cond))
+        if b.values is not None:
+            parts.append("ret " + irm.fmt_multi(b.values))
+        if b.error:
+            parts.append("err " + b.error)
+        return "\n".join(parts)
+
+    merged_any = False
+    while True:
+        texts, temps, defs = {}, {}, {}
+        for bid, b in blocks.items():
+            tx = text(b)
+            order = []
+            for mo in _temp_re.finditer(tx):
+                if mo.group(1) not in order:
+                    order.append(mo.group(1))
+            pos = {t: i for i, t in enumerate(order)}
+            texts[bid] = _temp_re.sub(lambda mo: "T#%d" % pos[mo.group(1)], tx)
+            temps[bid] = order
+            for s in b.stmts:
+                if isinstance(s, irm.CallStmt):
+                    defs[s.t] = bid
+        part = Partition(blocks, texts)
+        while True:
+            part.refine()
+            cls = part.cls
+            groups = {}
+            for bid in sorted(blocks):
+                groups.setdefault(cls[bid], []).append(bid)
+            rep = {}
+            for g in groups.values():
+                r = entry if entry in g else g[0]
+                for bid in g:
+                    rep[bid] = r
+
+            rmap = {}
+            for bid, r in rep.items():
+                if bid != r:
+                    for x, y in zip(temps[bid], temps[r]):
+                        if x != y and defs.get(x) == bid:
+                            rmap[x] = y
+
+            bad = set()
+            for bid, r in rep.items():
+                if bid == r:
+                    continue
+                for x, y in zip(temps[bid], temps[r]):
+                    if rmap.get(x, x) != rmap.get(y, y):
+                        bad.add(bid)
+                        break
+            if not bad:
+                break
+            for bid in sorted(bad):
+                part.isolate(bid)
+        if all(bid == r for bid, r in rep.items()):
+            return entry, merged_any
+        merged_any = True
+        for bid in list(blocks):
+            if rep[bid] != bid:
+                del blocks[bid]
+        seen = set()
+        for b in blocks.values():
+            b.succ = [rep[s] for s in b.succ]
+            if rmap:
+                _rename_temps(b.stmts, rmap, seen)
+                _rename_temps([b.cond, b.values], rmap, seen)
+        recompute_preds(blocks)
+
+def thread_empty(entry, blocks):
+    def target(bid, seen=None):
+        seen = seen or set()
+        b = blocks[bid]
+        while b.kind == "goto" and not b.stmts and b.succ[0] not in seen and b.id != b.succ[0]:
+            seen.add(b.id)
+            b = blocks[b.succ[0]]
+        return b.id
+    entry = target(entry)
+    for b in blocks.values():
+        b.succ = [target(s) for s in b.succ]
+
+    for b in blocks.values():
+        if b.kind == "cond" and b.succ[0] == b.succ[1]:
+            b.kind = "goto"
+            b.succ = [b.succ[0]]
+            b.cond = None
+    reach = reachable(entry, blocks)
+    for bid in list(blocks):
+        if bid not in reach:
+            del blocks[bid]
+    recompute_preds(blocks)
+
+    changed = True
+    while changed:
+        changed = False
+        for b in list(blocks.values()):
+            if b.id not in blocks or b.kind != "goto":
+                continue
+            s = blocks[b.succ[0]]
+            if s.id == b.id or len(s.preds) != 1 or s.id == entry:
+                continue
+            b.stmts += s.stmts
+            b.kind, b.cond, b.succ, b.values, b.error = s.kind, s.cond, s.succ, s.values, s.error
+            del blocks[s.id]
+            for x in b.succ:
+                if x in blocks:
+                    ps = blocks[x].preds
+                    for pi, p in enumerate(ps):
+                        if p == s.id:
+                            ps[pi] = b.id
+            changed = True
+    recompute_preds(blocks)
+    return entry
+
+def reachable(entry, blocks):
+    seen = set()
+    st = [entry]
+    while st:
+        x = st.pop()
+        if x in seen or x not in blocks:
+            continue
+        seen.add(x)
+        st += blocks[x].succ
+    return seen
+
+def recompute_preds(blocks):
+    for b in blocks.values():
+        b.preds = []
+    for b in blocks.values():
+        for s in b.succ:
+            if s in blocks:
+                blocks[s].preds.append(b.id)
+
+def rpo(entry, succ):
+    order = []
+    seen = set()
+    stack = [(entry, iter(succ(entry)))]
+    seen.add(entry)
+    while stack:
+        n, it = stack[-1]
+        for s in it:
+            if s not in seen:
+                seen.add(s)
+                stack.append((s, iter(succ(s))))
+                break
+        else:
+            stack.pop()
+            order.append(n)
+    order.reverse()
+    return order
+
+def dominators(entry, succ, preds):
+    order = rpo(entry, succ)
+    index = {n: i for i, n in enumerate(order)}
+    idom = {entry: entry}
+
+    def intersect(a, b):
+        while a != b:
+            while index[a] > index[b]:
+                a = idom[a]
+            while index[b] > index[a]:
+                b = idom[b]
+        return a
+    changed = True
+    while changed:
+        changed = False
+        for n in order[1:]:
+            ps = [p for p in preds(n) if p in idom and p in index]
+            if not ps:
+                continue
+            new = ps[0]
+            for p in ps[1:]:
+                new = intersect(p, new)
+            if idom.get(n) != new:
+                idom[n] = new
+                changed = True
+    return idom, index
+
+dom_spans = {}
+
+def dom_span(idom):
+    hit = dom_spans.get(id(idom))
+    if hit is not None and hit[0] is idom and hit[1] == len(idom):
+        return hit[2]
+    kids = {}
+    roots = []
+    for n, p in idom.items():
+        if p is None or p == n:
+            roots.append(n)
+        else:
+            kids.setdefault(p, []).append(n)
+    roots += [p for p in kids if p not in idom]
+    span = {}
+    clock = 0
+    for root in roots:
+        stack = [(root, iter(kids.get(root, ())))]
+        span[root] = [clock, clock]
+        clock += 1
+        while stack:
+            node, it = stack[-1]
+            child = next(it, None)
+            if child is None:
+                stack.pop()
+                span[node][1] = clock
+                clock += 1
+            elif child not in span:
+                span[child] = [clock, clock]
+                clock += 1
+                stack.append((child, iter(kids.get(child, ()))))
+    dom_spans.clear()
+    dom_spans[id(idom)] = (idom, len(idom), span)
+    return span
+
+def dominates(idom, a, b):
+    if a == b:
+        return True
+    span = dom_span(idom)
+    sa = span.get(a)
+    sb = span.get(b)
+    if sa is None or sb is None:
+        return False
+    return sa[0] <= sb[0] and sb[1] <= sa[1]
+
+class SBlock(list):
+    pass
+
+class SIf:
+    def __init__(self, cond, then, els):
+        self.cond, self.then, self.els = cond, then, els
+
+class SLoop:
+    def __init__(self, body):
+        self.body = body
+        self.kind = "while"
+        self.cond = None
+        self.forinfo = None
+
+class SBreak:
+    pass
+
+class SContinue:
+    pass
+
+class SReturn:
+    def __init__(self, values):
+        self.values = values
+
+class SError:
+    def __init__(self, msg):
+        self.msg = msg
+
+class SCrash(SError):
+    def __init__(self):
+        self.msg = "LPH_CRASH"
+
+class SGotoState:
+    def __init__(self, target):
+        self.target = target
+
+class SStateMachine:
+    def __init__(self, entry, cases):
+        self.entry, self.cases = entry, cases
+
+class Structurer:
+    def __init__(self, entry, blocks):
+        self.entry = entry
+        self.blocks = blocks
+        succ = lambda n: blocks[n].succ
+        preds = lambda n: blocks[n].preds
+        self.idom, self.rpo_index = dominators(entry, succ, preds)
+
+        self.loops = {}
+        for b in blocks.values():
+            for s in b.succ:
+                if s in self.idom and b.id in self.idom and dominates(self.idom, s, b.id):
+                    self.loops.setdefault(s, set()).add(b.id)
+        self.loop_body = {}
+        for h, latches in self.loops.items():
+            body = {h}
+            st = list(latches)
+            while st:
+                x = st.pop()
+                if x in body:
+                    continue
+                body.add(x)
+                st += [p for p in blocks[x].preds if p in self.idom]
+            self.loop_body[h] = body
+
+        exits = [b.id for b in blocks.values() if not b.succ]
+        rsucc = {n: list(blocks[n].preds) for n in blocks}
+        rpred = {n: list(blocks[n].succ) for n in blocks}
+        rsucc[0] = exits
+        rpred[0] = []
+        for e in exits:
+            rpred[e] = rpred[e] + [0]
+
+        can = reachable_rev(0, rsucc)
+        for n in blocks:
+            if n not in can:
+                rsucc[0].append(n)
+                rpred[n] = rpred[n] + [0]
+        self.ipdom, _ = dominators(0, lambda n: rsucc.get(n, []), lambda n: rpred.get(n, []))
+        self.emitted = set()
+        self.fallbacks = 0
+        self.stub_follows = set()
+        self.gotos = []
+        self.loop_exit = {}
+
+    def ipdom_of(self, n):
+        p = self.ipdom.get(n)
+        return None if p in (None, 0) else p
+
+    def run(self):
+        return self.region(self.entry, None, None)
+
+    def region(self, cur, stop, loop):
+        out = SBlock()
+        guard = 0
+        while cur is not None and cur != stop:
+            guard += 1
+            if guard > 100000:
+                out.append(SError("structuring did not terminate"))
+                break
+            if loop is not None:
+                h, body, ex = loop
+                if cur == h:
+                    out.append(SContinue())
+                    return out
+                if cur == ex:
+                    out.append(SBreak())
+                    return out
+                if cur not in body:
+                    tail = self.terminal_tail(cur, loop)
+                    if tail is not None:
+                        out += tail
+                        return out
+                    if self.same_as_exit(cur, ex):
+                        out.append(SBreak())
+                        return out
+                    if self.breaking_region(cur, h, body, ex):
+                        out += self.region(cur, ex, None)
+                        out.append(SBreak())
+                        return out
+                    if self.returning_region(cur, body):
+                        out += self.region(cur, None, None)
+                        return out
+                    out.append(SGotoState(cur))
+                    self.gotos.append(("exit", h, cur))
+                    self.debug_goto("leaves loop %s (exit %s: %s %s, %d stmts)" % (
+                        h, ex, self.blocks[ex].kind if ex in self.blocks else "?",
+                        self.blocks[ex].succ if ex in self.blocks else "?",
+                        len(self.blocks[ex].stmts) if ex in self.blocks else -1), cur)
+                    self.fallbacks += 1
+                    return out
+            if cur in self.emitted and cur not in self.loops:
+                tail = self.terminal_tail(cur, loop)
+                if tail is not None:
+                    out += tail
+                    return out
+                out.append(SGotoState(cur))
+                self.gotos.append(("shared", cur))
+                self.debug_goto("already emitted (loop %s)" % (loop[0] if loop else None,), cur)
+                self.fallbacks += 1
+                return out
+            if cur in self.loops and (loop is None or loop[0] != cur):
+                cur = self.emit_loop(cur, out, loop)
+                lp = out[-1]
+                if lp.kind == "while" and not breaks(lp.body):
+                    return out
+                continue
+            if self.blocks[cur].kind in ("for", "forin"):
+                out.append(SError("for loop without back edge"))
+                return out
+            self.emitted.add(cur)
+            b = self.blocks[cur]
+            out += b.stmts
+            if b.kind == "ret":
+                out.append(SReturn(b.values))
+                return out
+            if b.kind == "error":
+                out.append(SError(b.error))
+                return out
+            if b.kind == "crash":
+                out.append(SCrash())
+                return out
+            if b.kind == "end":
+                return out
+            if b.kind == "goto":
+                cur = b.succ[0]
+                continue
+
+            t, e = b.succ
+            m = self.ipdom_of(cur)
+            if loop is not None and m is not None and m not in loop[1] and (m != loop[2] or m in self.stub_follows):
+                m = None
+            if loop is not None and m == loop[0]:
+                if (t == loop[0] or e == loop[0]) and stop is not None and stop != loop[0] and stop in loop[1]:
+                    c = b.cond if t == loop[0] else negate(b.cond)
+                    out.append(SIf(c, SBlock([SContinue()]), SBlock()))
+                    cur = e if t == loop[0] else t
+                    continue
+
+                m = self.common_join(t, e, loop) or m
+            if m is None:
+                m = self.common_join(t, e, loop)
+            if m is None:
+                then = self.region(t, stop, loop)
+                if terminal(then):
+                    out.append(SIf(b.cond, then, SBlock()))
+                    cur = e
+                    continue
+                els = self.region(e, stop, loop)
+                if terminal(els):
+                    out.append(SIf(negate(b.cond), els, SBlock()))
+                    out += then
+                    return out
+                out.append(SIf(b.cond, then, els))
+                return out
+            then = self.region(t, m, loop)
+            els = self.region(e, m, loop)
+            out.append(SIf(b.cond, then, els))
+            cur = m
+        return out
+
+    def emit_loop(self, h, out, outer):
+        body = self.loop_body[h]
+
+        exits = []
+        for n in body:
+            for s in self.blocks[n].succ:
+                if s not in body and s not in exits:
+                    exits.append(s)
+        ex = None
+        if len(exits) == 1:
+            ex = exits[0]
+        elif exits:
+            p = self.ipdom_of(h)
+            while p is not None and p in body:
+                p = self.ipdom_of(p)
+            ex = p if p in exits else min(exits, key=lambda x: self.rpo_index.get(x, 1 << 30))
+            ex = self.stub_follow(ex, exits, body)
+        self.emitted.add(h)
+        b = self.blocks[h]
+        if b.kind in ("for", "forin"):
+            ex = b.succ[1]
+        self.loop_exit[h] = ex
+        if b.kind in ("for", "forin"):
+            loop = (h, body, ex)
+            lp = SLoop(self.region(b.succ[0], None, loop))
+            lp.kind = b.kind
+            lp.forinfo = b.values
+            out.append(lp)
+            return ex
+        inner = SBlock(b.stmts)
+        loop = (h, body, ex)
+        if b.kind == "goto":
+            inner += self.region_after(b.succ[0], loop)
+        elif b.kind == "cond":
+            t, e = b.succ
+            m = self.ipdom_of(h)
+            if m is not None and m not in body:
+                m = None
+            if m is None:
+                m = self.common_join(t, e, loop)
+            then = self.region(t, m, loop)
+            els = self.region(e, m, loop)
+            inner.append(SIf(b.cond, then, els))
+            if m is not None:
+                inner += self.region(m, None, loop)
+        elif b.kind == "ret":
+            inner.append(SReturn(b.values))
+        elif b.kind == "error":
+            inner.append(SError(b.error))
+        elif b.kind == "crash":
+            inner.append(SCrash())
+        lp = SLoop(inner)
+        out.append(lp)
+        return ex
+
+    def is_exit_stub(self, x, body, limit=12):
+        b = self.blocks.get(x)
+        return (b is not None and b.kind == "goto" and x not in self.loops and len(b.stmts) <= limit
+                and all(p in body for p in b.preds))
+
+    def stub_follow(self, ex, exits, body):
+        if not self.is_exit_stub(ex, body):
+            return ex
+        f = self.blocks[ex].succ[0]
+        if f in body or f in self.loops:
+            return ex
+        n = 0
+        for x in exits:
+            if x == f:
+                n += 1
+            elif x != ex and self.is_exit_stub(x, body) and self.blocks[x].succ[0] == f:
+                n += 1
+        if not n:
+            return ex
+        self.stub_follows.add(f)
+        return f
+
+    def reach_from(self, start, loop):
+        seen = set()
+        st = [start]
+        while st:
+            x = st.pop()
+            if x in seen:
+                continue
+            if loop is not None and (x == loop[0] or x == loop[2] or x not in loop[1]):
+                continue
+            seen.add(x)
+            st += self.blocks[x].succ
+        return seen
+
+    def common_join(self, t, e, loop):
+        a = self.reach_from(t, loop)
+        if not a:
+            return None
+        both = [x for x in self.reach_from(e, loop) if x in a and x not in self.emitted]
+        if not both:
+            return None
+        m = min(both, key=lambda x: self.rpo_index.get(x, 1 << 30))
+
+        for h, body in self.loop_body.items():
+            if m in body and h != m and (loop is None or h != loop[0]) and (t not in body or e not in body):
+                return None
+        return m
+
+    def same_as_exit(self, cur, ex):
+        if ex is None or cur == ex or cur not in self.blocks or ex not in self.blocks:
+            return False
+        a, b = self.blocks[cur], self.blocks[ex]
+        if a.kind != "goto" or b.kind != "goto" or a.succ != b.succ or len(a.stmts) != len(b.stmts):
+            return False
+        import codegen
+        r = codegen.Renderer()
+        return all(r.stmt(x, "") == r.stmt(y, "") for x, y in zip(a.stmts, b.stmts))
+
+    def breaking_region(self, cur, h, body, ex, limit=40):
+        if ex is None or ex not in self.blocks:
+            return False
+        seen = set()
+        st = [cur]
+        while st:
+            x = st.pop()
+            if x == ex or x in seen:
+                continue
+            seen.add(x)
+            b = self.blocks[x]
+            if len(seen) > limit or x in self.emitted or x in body or b.kind not in ("goto", "cond"):
+                return False
+            if any(x in lb and h not in lb for lb in self.loop_body.values()):
+                return False
+            st += b.succ
+        return all(p in seen or p in body for x in seen for p in self.blocks[x].preds)
+
+    def returning_region(self, cur, body, limit=400):
+        seen = set()
+        st = [cur]
+        while st:
+            x = st.pop()
+            if x in seen:
+                continue
+            seen.add(x)
+            if len(seen) > limit or x in self.emitted:
+                return False
+            st += self.blocks[x].succ
+        for x in seen:
+            if any(p not in seen and p not in body for p in self.blocks[x].preds):
+                return False
+
+        for h, lb in self.loop_body.items():
+            if (h in seen) != bool(lb & seen) or (h in seen and not lb <= seen):
+                return False
+        return True
+
+    def debug_goto(self, why, cur):
+        if not os.environ.get("DEVIRT_DEBUG"):
+            return
+        if os.environ.get("DEVIRT_BLOCKS") and not getattr(self, "_dumped", False):
+            self._dumped = True
+            import codegen
+            r = codegen.Renderer()
+            for bid in sorted(self.blocks, key=lambda x: self.rpo_index.get(x, 1 << 30)):
+                bb = self.blocks[bid]
+                print("  B%s %s succ %s preds %s loops %s ipdom %s" % (bid, bb.kind, bb.succ, bb.preds, [h for h, body in self.loop_body.items() if bid in body], self.ipdom_of(bid)), file=sys.stderr)
+                for x in bb.stmts:
+                    try:
+                        print("      " + " ".join(r.stmt(x, "")), file=sys.stderr)
+                    except Exception:
+                        print("      ?", type(x).__name__, file=sys.stderr)
+                if bb.kind == "cond":
+                    try:
+                        print("      if " + r.expr(bb.cond), file=sys.stderr)
+                    except Exception:
+                        pass
+        b = self.blocks[cur]
+        print("[goto] block %s: %s; kind %s succ %s preds %s, %d stmts, origin %s, ipdom %s, loops containing: %s"
+              % (cur, why, b.kind, b.succ, b.preds, len(b.stmts), b.origin, self.ipdom_of(cur),
+                 [h for h, body in self.loop_body.items() if cur in body]), file=sys.stderr)
+
+    def terminal_tail(self, cur, loop=None, limit=40):
+        out = []
+        seen = set()
+        while True:
+            if loop is not None and cur == loop[0] and out is not None and seen:
+                out.append(SContinue())
+                return out
+            if loop is not None and cur == loop[2] and seen:
+                out.append(SBreak())
+                return out
+            if cur in seen or cur in self.loops:
+                return None
+            seen.add(cur)
+            b = self.blocks[cur]
+
+            out += [copy.deepcopy(s) for s in b.stmts]
+            if len(out) > limit:
+                return None
+            if b.kind == "ret":
+                out.append(SReturn(b.values))
+                return out
+            if b.kind == "error":
+                out.append(SError(b.error))
+                return out
+            if b.kind == "crash":
+                out.append(SCrash())
+                return out
+            if b.kind != "goto":
+                return None
+            cur = b.succ[0]
+
+    def region_after(self, cur, loop):
+        return self.region(cur, None, loop)
+
+split_limit = 3000
+
+def structure(entry, blocks, own=None, rounds=60):
+    first = {}
+    for bid, b in blocks.items():
+        c = first[bid] = copy.copy(b)
+        c.stmts, c.succ = list(b.stmts), list(b.succ)
+    first = (entry, first)
+    make_reducible(entry, blocks)
+    copied = 0
+    nflag = 0
+    for _ in range(rounds):
+        sr = Structurer(entry, blocks)
+        body = sr.run()
+        if not sr.gotos:
+            break
+        exits = [g for g in sr.gotos if g[0] == "exit" and g[1] in sr.loop_exit]
+        if exits:
+            nflag += 1
+            name = "exitTo" if nflag == 1 else "exitTo%d" % nflag
+            if own is not None:
+                own.add(name)
+            entry = unify_exits(entry, blocks, sr, exits[0][1], name)
+            continue
+        n = 0
+        for g in sr.gotos:
+            if g[0] == "shared" and g[1] in blocks and copied < split_limit:
+                k = split_node(blocks, g[1], sr)
+                if not k:
+                    hs = [h for h, body in sr.loop_body.items() if g[1] in body]
+                    hs.sort(key=lambda h: len(sr.loop_body[h]))
+                    for h in hs:
+                        k = split_node(blocks, h, sr, [p for p in blocks[h].preds
+                                                       if p not in sr.loop_body[h]])
+                        if k:
+                            break
+                copied += k
+                n += k > 0
+        if not n:
+            break
+    if sr.fallbacks and not any(b.kind in ("for", "forin") for b in first[1].values()):
+        if own is not None:
+            own.add("state")
+        body = state_machine(*first, "state")
+        sr.fallbacks = 0
+    return entry, body, sr
+
+state_ladder_max = 800
+state_ladder_part = 400
+
+def state_machine(entry, blocks, name):
+    import codegen as cg
+    order = rpo(entry, lambda n: blocks[n].succ)
+    num = {bid: i for i, bid in enumerate(order, 1)}
+
+    def goto(t):
+        return _set_stmt(name, num[t])
+    cases = []
+    for bid in order:
+        b = blocks[bid]
+        out = SBlock(b.stmts)
+        if b.kind == "goto":
+            out.append(goto(b.succ[0]))
+        elif b.kind == "cond":
+            out.append(SIf(b.cond, SBlock([goto(b.succ[0])]), SBlock([goto(b.succ[1])])))
+        elif b.kind == "ret":
+            out.append(SReturn(b.values))
+        elif b.kind == "error":
+            out.append(SError(b.error))
+        elif b.kind == "crash":
+            out.append(SCrash())
+        elif b.kind == "end":
+            out.append(SReturn(None))
+        else:
+            out.append(SError("state machine: unhandled block kind %s" % b.kind))
+        cases.append((num[bid], out))
+    def ladder(group):
+        chain = SBlock()
+        for k, out in reversed(group):
+            test = Bin("CompareEq", cg.LocalName(name), Const(k))
+            chain = SBlock([SIf(test, out, chain)])
+        return chain
+    if len(cases) <= state_ladder_max:
+        return SBlock([_set_stmt(name, 1), SLoop(ladder(cases))])
+    groups = [cases[i:i + state_ladder_part] for i in range(0, len(cases), state_ladder_part)]
+    chain = SBlock()
+    for group in reversed(groups):
+        test = Bin("CompareLe", cg.LocalName(name), Const(group[-1][0]))
+        chain = SBlock([SIf(test, ladder(group), chain)])
+    return SBlock([_set_stmt(name, 1), SLoop(chain)])
+
+def sccs(nodes, succ):
+    index, low, on, stack, out = {}, {}, set(), [], []
+    n = 0
+    for root in nodes:
+        if root in index:
+            continue
+        work = [(root, iter([s for s in succ(root) if s in nodes]))]
+        index[root] = low[root] = n
+        n += 1
+        stack.append(root)
+        on.add(root)
+        while work:
+            v, it = work[-1]
+            for w in it:
+                if w not in index:
+                    index[w] = low[w] = n
+                    n += 1
+                    stack.append(w)
+                    on.add(w)
+                    work.append((w, iter([s for s in succ(w) if s in nodes])))
+                    break
+                if w in on:
+                    low[v] = min(low[v], index[w])
+            else:
+                work.pop()
+                if work:
+                    low[work[-1][0]] = min(low[work[-1][0]], low[v])
+                if low[v] == index[v]:
+                    comp = set()
+                    while True:
+                        w = stack.pop()
+                        on.discard(w)
+                        comp.add(w)
+                        if w == v:
+                            break
+                    out.append(comp)
+    return out
+
+def make_reducible(entry, blocks):
+    copied = 0
+    for _ in range(200):
+        order = rpo(entry, lambda n: blocks[n].succ)
+        rank = {n: i for i, n in enumerate(order)}
+        if not _split_irreducible(entry, blocks, set(order), rank):
+            break
+        copied += 1
+        if sum(len(b.stmts) + 1 for b in blocks.values()) > 50 * split_limit:
+            break
+    return copied
+
+def _split_irreducible(entry, blocks, nodes, rank):
+    succ = lambda n: blocks[n].succ
+    for comp in sccs(sorted(nodes, key=lambda n: rank.get(n, 1 << 30)), succ):
+        if len(comp) == 1:
+            continue
+        entries = sorted({n for n in comp if n == entry or any(p not in comp for p in blocks[n].preds)},
+                         key=lambda n: rank.get(n, 1 << 30))
+        if not entries:
+            continue
+        h = entries[0]
+        if len(entries) > 1:
+            e = entries[1]
+
+            region = []
+            st = [e]
+            while st:
+                x = st.pop()
+                if x in region or x == h or x not in comp:
+                    continue
+                region.append(x)
+                st += blocks[x].succ
+            m = copy_region(blocks, region)
+            for p in set(blocks[e].preds):
+                if p not in comp:
+                    blocks[p].succ = [m[e] if s == e else s for s in blocks[p].succ]
+            recompute_preds(blocks)
+            return True
+        if _split_irreducible(entry, blocks, comp - {h}, rank):
+            return True
+    return False
+
+def copy_region(blocks, region):
+    m = {}
+    for r in region:
+        m[r] = _new_id(blocks)
+        blocks[m[r]] = Block(m[r])
+    memo = {}
+    for r in region:
+        o, c = blocks[r], blocks[m[r]]
+        c.stmts = copy.deepcopy(o.stmts, memo)
+        c.cond = copy.deepcopy(o.cond, memo)
+        c.values = copy.deepcopy(o.values, memo)
+        c.kind, c.error, c.origin, c.path = o.kind, o.error, o.origin, o.path
+        c.succ = [m.get(s, s) for s in o.succ]
+    return m
+
+def _new_id(blocks):
+    return max(blocks) + 1
+
+def _set_stmt(name, v):
+    import codegen as cg
+    return cg.AssignS([cg.LocalName(name)], sym.Multi([Const(v)]))
+
+def unify_exits(entry, blocks, sr, h, name):
+    import codegen as cg
+    body = sr.loop_body[h]
+    main = sr.loop_exit[h]
+    exits = []
+    for n in sorted(body, key=lambda x: sr.rpo_index.get(x, 1 << 30)):
+        for s in blocks[n].succ:
+            if s not in body and s not in exits:
+                exits.append(s)
+    others = [x for x in exits if x != main]
+    if main is None:
+        main, others = others[-1], others[:-1]
+
+    disp = []
+    for k, x in enumerate(others, 1):
+        d = Block(_new_id(blocks))
+        blocks[d.id] = d
+        d.kind = "cond"
+        d.cond = Bin("CompareEq", cg.LocalName(name), Const(k))
+        disp.append(d)
+    for i, d in enumerate(disp):
+        d.succ = [others[i], disp[i + 1].id if i + 1 < len(disp) else main]
+    head = disp[0].id if disp else main
+    stub = {}
+    for k, x in enumerate(others, 1):
+        st = Block(_new_id(blocks))
+        blocks[st.id] = st
+        st.stmts = [_set_stmt(name, k)]
+        st.succ = [head]
+        stub[x] = st.id
+    stub[main] = head
+    for n in body:
+        b = blocks[n]
+        b.succ = [stub.get(s, s) if s not in body else s for s in b.succ]
+
+    pre = Block(_new_id(blocks))
+    blocks[pre.id] = pre
+    pre.stmts = [_set_stmt(name, None)]
+    pre.succ = [h]
+    for p in set(blocks[h].preds):
+        if p not in body:
+            blocks[p].succ = [pre.id if s == h else s for s in blocks[p].succ]
+    if h == entry:
+        entry = pre.id
+    recompute_preds(blocks)
+    return entry
+
+def split_node(blocks, x, sr, preds=None):
+    b = blocks[x]
+    cand, preds = b.preds if preds is None else preds, []
+    for p in cand:
+        if p not in preds and p != x:
+            preds.append(p)
+    if len(preds) < 2:
+        return 0
+    preds.sort(key=lambda p: sr.rpo_index.get(p, 1 << 30))
+
+    def region_to(stop):
+        out = []
+        st = [x]
+        while st:
+            n = st.pop()
+            if n in out or n == stop or n not in blocks or not dominates(sr.idom, x, n):
+                continue
+            out.append(n)
+            st += blocks[n].succ
+        return out, sum(len(blocks[n].stmts) + 1 for n in out)
+
+    fork = sr.idom.get(x)
+    for stop in ([sr.ipdom_of(fork)] if fork is not None and fork != x else []) + [sr.ipdom_of(x)]:
+        region, size = region_to(stop)
+        if x in region and size <= split_limit // 4:
+            break
+    else:
+        region, size = [x], len(b.stmts) + 1
+    n = 0
+    for p in preds[1:]:
+        m = copy_region(blocks, region)
+        pb = blocks[p]
+        pb.succ = [m[x] if s == x else s for s in pb.succ]
+        n += size
+    recompute_preds(blocks)
+    return n
+
+def reachable_rev(start, succ):
+    seen = set()
+    st = [start]
+    while st:
+        x = st.pop()
+        if x in seen:
+            continue
+        seen.add(x)
+        st += succ.get(x, [])
+    return seen
+
+def negate(c):
+    from luasym import Un, Bin
+    if isinstance(c, Un) and c.op == "Not":
+        return c.a
+    flip = {"CompareEq": "CompareNe", "CompareNe": "CompareEq"}
+    if isinstance(c, Bin) and c.op in flip:
+        return Bin(flip[c.op], c.a, c.b)
+    return Un("Not", c)
+
+def cleanup(stmts, in_loop_tail=False):
+    out = SBlock()
+    for i, st in enumerate(stmts):
+        dead_after = isinstance(st, SIf) and terminal(st.then) and terminal(st.els)
+        last = i == len(stmts) - 1 or dead_after
+        if isinstance(st, SIf):
+            st.then = cleanup(st.then, in_loop_tail and last)
+            st.els = cleanup(st.els, in_loop_tail and last)
+            if in_loop_tail and last:
+                st.els = _tail_guard_to_if(st.els)
+            if not st.then and st.els:
+                st.cond, st.then, st.els = negate(st.cond), st.els, SBlock()
+            if not st.then and not st.els and not _has_call(st.cond):
+                st = None
+        elif isinstance(st, SLoop):
+            st.body = cleanup(st.body, True)
+        elif isinstance(st, SContinue) and last and in_loop_tail:
+            st = None
+        if st is not None:
+            out.append(st)
+        if dead_after:
+            break
+    return out
+
+def _tail_guard_to_if(stmts):
+    if (len(stmts) >= 2 and isinstance(stmts[0], SIf) and not stmts[0].els
+            and len(stmts[0].then) == 1 and isinstance(stmts[0].then[0], SContinue)):
+        return SBlock([SIf(negate(stmts[0].cond), SBlock(stmts[1:]), SBlock())])
+    return stmts
+
+def _has_call(e):
+    import codegen as cg
+    return any(isinstance(x, cg.CallE) for x in cg.walk(e))
+
+def breaks(stmts):
+    for st in stmts:
+        if isinstance(st, SBreak):
+            return True
+        if isinstance(st, SIf) and (breaks(st.then) or breaks(st.els)):
+            return True
+    return False
+
+def terminal(stmts):
+    if not stmts:
+        return False
+    last = stmts[-1]
+    if isinstance(last, (SReturn, SBreak, SContinue, SError, SGotoState)):
+        return True
+    if isinstance(last, SIf):
+        return terminal(last.then) and terminal(last.els)
+    return False

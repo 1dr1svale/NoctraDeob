@@ -1,0 +1,29 @@
+{
+  "chunk_hash": {
+    "multiplier": 31,
+    "modulus": 2147483648,
+    "stride": 4096,
+    "min_len": 4096
+  },
+  "nonce_hex_bytes": 8,
+  "heartbeat_seconds": 2,
+  "stall_seconds": 1200,
+  "markers": [
+    "ENVLOG-BEGIN",
+    "ENVLOG-END",
+    "ENVLOG-STRINGS",
+    "ENVLOG-FAIL",
+    "HB",
+    "TR",
+    "P2DCHECK",
+    "P2D",
+    "P2DMISS",
+    "HOOKERR",
+    "TRIGGER",
+    "FORCE",
+    "UNSCRAMBLED",
+    "PROTOS",
+    "CHUNK",
+    "FETCH"
+  ]
+}
